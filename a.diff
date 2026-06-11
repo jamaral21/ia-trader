@@ -1,0 +1,774 @@
+diff --git a/ARCHITECTURE.md b/ARCHITECTURE.md
+new file mode 100644
+index 0000000..02d554a
+--- /dev/null
++++ b/ARCHITECTURE.md
+@@ -0,0 +1,76 @@
++# SignalEA_v1 - Arquitectura Tecnica
++
++## Objetivo
++Base mantenible y extensible para implementar SignalEA_v1 por etapas, sin acoplar logica de estrategia, riesgo y ejecucion.
++
++## Estructura de carpetas
++- Core: orquestacion, estado, logging
++- Market: tiempo de barras y acceso a series
++- Indicators: capa de indicadores y snapshots
++- Signal: evaluacion de senales y filtros
++- Trading: ejecucion y servicios de posicion
++- Risk: politicas e interfaces de lotaje
++- Management: trailing, salidas y sesiones
++- Integration: evolucion Maestro-Esclavo
++- Debug: diagnostico y telemetria
++
++## Contratos clave
++- SIndicatorSnapshot: contrato unico de indicadores para motor de senales.
++- SSignalDecision: intencion de negocio desacoplada de ejecucion.
++- STradeRequestPlan: plan ejecutable y serializable para modo local o replicado.
++
++## Flujo OnInit
++1. Crear kernel y logger.
++2. Validar contexto operativo.
++3. Inicializar IndicatorHub y estado RUNNING.
++4. Exponer estado inicial global.
++
++## Flujo OnTick
++1. Guard clause de estado.
++2. Detectar nueva vela H1 con BarClock.
++3. Si no hay nueva vela, salir.
++4. Actualizar snapshot de indicadores.
++5. Leer posicion actual.
++6. Evaluar senal y politicas de riesgo.
++7. Construir plan de trade y delegar a TradeExecutor.
++8. Registrar resultado en estado global.
++
++## Flujo OnDeinit
++1. Cambiar a estado STOPPING.
++2. Liberar recursos de indicadores.
++3. Liberar kernel.
++4. Cerrar estado en STOPPED.
++
++## Maquina de estados
++- EA_STATE_BOOT
++- EA_STATE_READY
++- EA_STATE_RUNNING
++- EA_STATE_DEGRADED
++- EA_STATE_STOPPING
++- EA_STATE_STOPPED
++
++## Dependencias (texto)
++SignalEA_v1.mq5
++-> AppKernel
++-> StateStore
++-> Logger
++
++AppKernel
++-> BarClock
++-> IndicatorHub
++-> SignalEngine
++-> PositionService
++-> RiskPolicy
++-> TradeExecutor
++-> TrailingService
++
++Integration (futuro)
++-> ReplicationService
++-> MessageBus
++-> MasterSlaveProtocol
++
++## Funciones intencionalmente no implementadas en esta fase
++- TradeExecutor::OpenLong
++- TradeExecutor::OpenShort
++- LotModel::CalculateLotSize
++- TrailingService::ManageTrailing
+diff --git a/Core/AppKernel.mqh b/Core/AppKernel.mqh
+new file mode 100644
+index 0000000..512f608
+--- /dev/null
++++ b/Core/AppKernel.mqh
+@@ -0,0 +1,97 @@
++#pragma once
++
++#include "Logger.mqh"
++#include "StateStore.mqh"
++#include "..\SignalEA_v1.inputs.mqh"
++#include "..\Market\BarClock.mqh"
++#include "..\Indicators\IndicatorHub.mqh"
++#include "..\Signal\SignalEngine.mqh"
++#include "..\Trading\PositionService.mqh"
++#include "..\Trading\TradeExecutor.mqh"
++#include "..\Risk\RiskPolicy.mqh"
++#include "..\Management\TrailingService.mqh"
++
++class AppKernel
++{
++private:
++   Logger m_logger;
++   StateStore m_state;
++   BarClock m_barClock;
++   IndicatorHub m_indicatorHub;
++   SignalEngine m_signalEngine;
++   PositionService m_positionService;
++   TradeExecutor m_tradeExecutor;
++   RiskPolicy m_riskPolicy;
++   TrailingService m_trailingService;
++
++public:
++   bool Initialize(void);
++   void ProcessTick(void);
++   void Shutdown(const int reason);
++
++private:
++   bool ProcessNewH1Bar(const datetime barTime);
++};
++
++bool AppKernel::Initialize(void)
++{
++   m_logger.SetLevel(InpLogLevel);
++   m_state.SetEAState(EA_STATE_BOOT);
++
++   bool indicatorReady = m_indicatorHub.Initialize(_Symbol, InpSignalTf);
++   if(!indicatorReady)
++   {
++      m_state.SetEAState(EA_STATE_DEGRADED);
++      return false;
++   }
++
++   m_state.SetEAState(EA_STATE_RUNNING);
++   return true;
++}
++
++void AppKernel::ProcessTick(void)
++{
++   if(m_state.GetEAState() != EA_STATE_RUNNING)
++      return;
++
++   datetime barTime = 0;
++   if(!m_barClock.IsNewBar(_Symbol, InpSignalTf, barTime))
++      return;
++
++   ProcessNewH1Bar(barTime);
++}
++
++bool AppKernel::ProcessNewH1Bar(const datetime barTime)
++{
++   SIndicatorSnapshot ind;
++   SPositionSnapshot pos;
++
++   if(!m_indicatorHub.Refresh())
++      return false;
++
++   if(!m_indicatorHub.GetSnapshot(ind))
++      return false;
++
++   if(!m_positionService.GetCurrent(_Symbol, InpMagicNumber, pos))
++      return false;
++
++   SSignalDecision decision = m_signalEngine.Evaluate(ind, pos);
++   if(!m_riskPolicy.CanOpen(decision, pos))
++      return true;
++
++   STradeRequestPlan plan;
++   plan.action = TRADE_ACTION_NONE;
++   plan.volume = 0.0;
++   plan.sl = 0.0;
++   plan.tp = 0.0;
++   plan.comment = "ARCH_PLACEHOLDER";
++
++   return m_tradeExecutor.ExecutePlan(plan);
++}
++
++void AppKernel::Shutdown(const int reason)
++{
++   m_state.SetEAState(EA_STATE_STOPPING);
++   m_indicatorHub.Release();
++   m_state.SetEAState(EA_STATE_STOPPED);
++}
+diff --git a/Core/Logger.mqh b/Core/Logger.mqh
+new file mode 100644
+index 0000000..a02b638
+--- /dev/null
++++ b/Core/Logger.mqh
+@@ -0,0 +1,35 @@
++#pragma once
++
++class Logger
++{
++private:
++   int m_level;
++
++public:
++   Logger(void) : m_level(2) {}
++
++   void SetLevel(const int level) { m_level = level; }
++
++   void Info(const string msg) const
++   {
++      if(m_level >= 2)
++         Print("[INFO] ", msg);
++   }
++
++   void Warn(const string msg) const
++   {
++      if(m_level >= 1)
++         Print("[WARN] ", msg);
++   }
++
++   void Error(const string msg) const
++   {
++      Print("[ERROR] ", msg);
++   }
++
++   void Debug(const string msg) const
++   {
++      if(m_level >= 3)
++         Print("[DEBUG] ", msg);
++   }
++};
+diff --git a/Core/StateStore.mqh b/Core/StateStore.mqh
+new file mode 100644
+index 0000000..f260e77
+--- /dev/null
++++ b/Core/StateStore.mqh
+@@ -0,0 +1,19 @@
++#pragma once
++
++#include "..\SignalEA_v1.types.mqh"
++
++class StateStore
++{
++private:
++   ENUM_EA_STATE m_state;
++   datetime m_lastProcessedBar;
++
++public:
++   StateStore(void) : m_state(EA_STATE_BOOT), m_lastProcessedBar(0) {}
++
++   void SetEAState(const ENUM_EA_STATE s) { m_state = s; }
++   ENUM_EA_STATE GetEAState(void) const { return m_state; }
++
++   void SetLastProcessedBar(const datetime t) { m_lastProcessedBar = t; }
++   datetime GetLastProcessedBar(void) const { return m_lastProcessedBar; }
++};
+diff --git a/Indicators/IndicatorHub.mqh b/Indicators/IndicatorHub.mqh
+new file mode 100644
+index 0000000..52d45d4
+--- /dev/null
++++ b/Indicators/IndicatorHub.mqh
+@@ -0,0 +1,46 @@
++#pragma once
++
++#include "..\SignalEA_v1.types.mqh"
++
++class IndicatorHub
++{
++private:
++   string m_symbol;
++   ENUM_TIMEFRAMES m_tf;
++
++public:
++   IndicatorHub(void) : m_symbol(""), m_tf(PERIOD_H1) {}
++
++   bool Initialize(const string symbol, const ENUM_TIMEFRAMES tf);
++   bool Refresh(void);
++   bool GetSnapshot(SIndicatorSnapshot &outSnapshot) const;
++   void Release(void);
++};
++
++bool IndicatorHub::Initialize(const string symbol, const ENUM_TIMEFRAMES tf)
++{
++   m_symbol = symbol;
++   m_tf = tf;
++   return true;
++}
++
++bool IndicatorHub::Refresh(void)
++{
++   return true;
++}
++
++bool IndicatorHub::GetSnapshot(SIndicatorSnapshot &outSnapshot) const
++{
++   outSnapshot.barTime = 0;
++   outSnapshot.emaFast = 0.0;
++   outSnapshot.emaSlow = 0.0;
++   outSnapshot.atr = 0.0;
++   outSnapshot.donchianHigh = 0.0;
++   outSnapshot.donchianLow = 0.0;
++   outSnapshot.isValid = false;
++   return true;
++}
++
++void IndicatorHub::Release(void)
++{
++}
+diff --git a/Integration/MasterSlaveProtocol.mqh b/Integration/MasterSlaveProtocol.mqh
+new file mode 100644
+index 0000000..0417274
+--- /dev/null
++++ b/Integration/MasterSlaveProtocol.mqh
+@@ -0,0 +1,23 @@
++#pragma once
++
++#include "..\SignalEA_v1.types.mqh"
++
++class MasterSlaveProtocol
++{
++public:
++   bool EncodeTradePlan(const STradeRequestPlan &plan, string &outPayload) const
++   {
++      outPayload = "";
++      return false;
++   }
++
++   bool DecodeTradePlan(const string payload, STradeRequestPlan &outPlan) const
++   {
++      outPlan.action = TRADE_ACTION_NONE;
++      outPlan.volume = 0.0;
++      outPlan.sl = 0.0;
++      outPlan.tp = 0.0;
++      outPlan.comment = "";
++      return false;
++   }
++};
+diff --git a/Integration/MessageBus.mqh b/Integration/MessageBus.mqh
+new file mode 100644
+index 0000000..0c7e753
+--- /dev/null
++++ b/Integration/MessageBus.mqh
+@@ -0,0 +1,10 @@
++#pragma once
++
++class MessageBus
++{
++public:
++   bool Connect(void) { return true; }
++   void Disconnect(void) {}
++   bool Publish(const string topic, const string payload) { return false; }
++   bool Subscribe(const string topic) { return false; }
++};
+diff --git a/Integration/ReplicationService.mqh b/Integration/ReplicationService.mqh
+new file mode 100644
+index 0000000..17c955b
+--- /dev/null
++++ b/Integration/ReplicationService.mqh
+@@ -0,0 +1,15 @@
++#pragma once
++
++#include "MessageBus.mqh"
++#include "MasterSlaveProtocol.mqh"
++
++class ReplicationService
++{
++private:
++   MessageBus m_bus;
++   MasterSlaveProtocol m_protocol;
++
++public:
++   bool Start(void) { return m_bus.Connect(); }
++   void Stop(void) { m_bus.Disconnect(); }
++};
+diff --git a/Management/TrailingService.mqh b/Management/TrailingService.mqh
+new file mode 100644
+index 0000000..f114205
+--- /dev/null
++++ b/Management/TrailingService.mqh
+@@ -0,0 +1,10 @@
++#pragma once
++
++#include "..\SignalEA_v1.types.mqh"
++
++class TrailingService
++{
++public:
++   // Intentionally not implemented in this phase.
++   void ManageTrailing(const SPositionSnapshot &pos, const SIndicatorSnapshot &ind);
++};
+diff --git a/Market/BarClock.mqh b/Market/BarClock.mqh
+new file mode 100644
+index 0000000..347ee2d
+--- /dev/null
++++ b/Market/BarClock.mqh
+@@ -0,0 +1,26 @@
++#pragma once
++
++class BarClock
++{
++public:
++   bool IsNewBar(const string symbol, const ENUM_TIMEFRAMES tf, datetime &outBarTime);
++   datetime GetLastClosedBarTime(const string symbol, const ENUM_TIMEFRAMES tf);
++};
++
++bool BarClock::IsNewBar(const string symbol, const ENUM_TIMEFRAMES tf, datetime &outBarTime)
++{
++   datetime lastClosed = GetLastClosedBarTime(symbol, tf);
++   outBarTime = lastClosed;
++   return (lastClosed > 0);
++}
++
++datetime BarClock::GetLastClosedBarTime(const string symbol, const ENUM_TIMEFRAMES tf)
++{
++   datetime times[];
++   ArraySetAsSeries(times, true);
++   int copied = CopyTime(symbol, tf, 1, 1, times);
++   if(copied < 1)
++      return 0;
++
++   return times[0];
++}
+diff --git a/Risk/LotModel.mqh b/Risk/LotModel.mqh
+new file mode 100644
+index 0000000..73666d3
+--- /dev/null
++++ b/Risk/LotModel.mqh
+@@ -0,0 +1,10 @@
++#pragma once
++
++#include "..\SignalEA_v1.types.mqh"
++
++class LotModel
++{
++public:
++   // Intentionally not implemented in this phase.
++   double CalculateLotSize(const SIndicatorSnapshot &ind, const SPositionSnapshot &pos);
++};
+diff --git a/Risk/RiskPolicy.mqh b/Risk/RiskPolicy.mqh
+new file mode 100644
+index 0000000..734bd5b
+--- /dev/null
++++ b/Risk/RiskPolicy.mqh
+@@ -0,0 +1,12 @@
++#pragma once
++
++#include "..\SignalEA_v1.types.mqh"
++
++class RiskPolicy
++{
++public:
++   bool CanOpen(const SSignalDecision &decision, const SPositionSnapshot &pos) const
++   {
++      return decision.canTrade && !pos.hasPosition;
++   }
++};
+diff --git a/Signal/SignalEngine.mqh b/Signal/SignalEngine.mqh
+new file mode 100644
+index 0000000..77e5d69
+--- /dev/null
++++ b/Signal/SignalEngine.mqh
+@@ -0,0 +1,19 @@
++#pragma once
++
++#include "..\SignalEA_v1.types.mqh"
++
++class SignalEngine
++{
++public:
++   SSignalDecision Evaluate(const SIndicatorSnapshot &ind, const SPositionSnapshot &pos);
++};
++
++SSignalDecision SignalEngine::Evaluate(const SIndicatorSnapshot &ind, const SPositionSnapshot &pos)
++{
++   SSignalDecision decision;
++   decision.signal = SIGNAL_NONE;
++   decision.confidence = 0.0;
++   decision.reasonCode = "ARCH_PLACEHOLDER";
++   decision.canTrade = false;
++   return decision;
++}
+diff --git a/SignalEA_v1.constants.mqh b/SignalEA_v1.constants.mqh
+new file mode 100644
+index 0000000..204e20b
+--- /dev/null
++++ b/SignalEA_v1.constants.mqh
+@@ -0,0 +1,6 @@
++#pragma once
++
++#define EA_NAME "SignalEA_v1"
++#define EA_VERSION "0.1.0-arch"
++
++#define INVALID_TICKET (-1)
+diff --git a/SignalEA_v1.globals.mqh b/SignalEA_v1.globals.mqh
+new file mode 100644
+index 0000000..191c98a
+--- /dev/null
++++ b/SignalEA_v1.globals.mqh
+@@ -0,0 +1,16 @@
++#pragma once
++
++#include "SignalEA_v1.inputs.mqh"
++#include "SignalEA_v1.types.mqh"
++
++class AppKernel;
++
++extern bool g_isInitialized;
++extern bool g_isTradingEnabled;
++extern datetime g_lastProcessedH1BarTime;
++extern datetime g_lastTickTime;
++extern int g_lastErrorCode;
++extern uint g_lastTradeRetcode;
++extern ENUM_SIGNAL_TYPE g_lastSignal;
++
++extern AppKernel *g_kernel;
+diff --git a/SignalEA_v1.inputs.mqh b/SignalEA_v1.inputs.mqh
+new file mode 100644
+index 0000000..bc8ef9c
+--- /dev/null
++++ b/SignalEA_v1.inputs.mqh
+@@ -0,0 +1,9 @@
++#pragma once
++
++input long InpMagicNumber = 51001;
++input int InpSlippagePoints = 10;
++input int InpMaxSpreadPoints = 30;
++input bool InpAllowLong = true;
++input bool InpAllowShort = true;
++input ENUM_TIMEFRAMES InpSignalTf = PERIOD_H1;
++input int InpLogLevel = 2;
+diff --git a/SignalEA_v1.mq5 b/SignalEA_v1.mq5
+new file mode 100644
+index 0000000..9ffc2b4
+--- /dev/null
++++ b/SignalEA_v1.mq5
+@@ -0,0 +1,53 @@
++#property strict
++#property version   "0.1"
++#property description "SignalEA_v1 architecture skeleton"
++
++#include "SignalEA_v1.constants.mqh"
++#include "SignalEA_v1.inputs.mqh"
++#include "SignalEA_v1.types.mqh"
++#include "SignalEA_v1.globals.mqh"
++#include "Core/AppKernel.mqh"
++
++bool g_isInitialized = false;
++bool g_isTradingEnabled = false;
++datetime g_lastProcessedH1BarTime = 0;
++datetime g_lastTickTime = 0;
++int g_lastErrorCode = 0;
++uint g_lastTradeRetcode = 0;
++ENUM_SIGNAL_TYPE g_lastSignal = SIGNAL_NONE;
++
++AppKernel *g_kernel = NULL;
++
++int OnInit(void)
++{
++   g_kernel = new AppKernel();
++   if(g_kernel == NULL)
++      return INIT_FAILED;
++
++   g_isInitialized = g_kernel.Initialize();
++   if(!g_isInitialized)
++      return INIT_FAILED;
++
++   return INIT_SUCCEEDED;
++}
++
++void OnTick(void)
++{
++   if(g_kernel == NULL)
++      return;
++
++   g_lastTickTime = TimeCurrent();
++   g_kernel.ProcessTick();
++}
++
++void OnDeinit(const int reason)
++{
++   if(g_kernel != NULL)
++   {
++      g_kernel.Shutdown(reason);
++      delete g_kernel;
++      g_kernel = NULL;
++   }
++
++   g_isInitialized = false;
++}
+diff --git a/SignalEA_v1.types.mqh b/SignalEA_v1.types.mqh
+new file mode 100644
+index 0000000..6c6a070
+--- /dev/null
++++ b/SignalEA_v1.types.mqh
+@@ -0,0 +1,90 @@
++#pragma once
++
++enum ENUM_EA_STATE
++{
++   EA_STATE_BOOT = 0,
++   EA_STATE_READY,
++   EA_STATE_RUNNING,
++   EA_STATE_DEGRADED,
++   EA_STATE_STOPPING,
++   EA_STATE_STOPPED
++};
++
++enum ENUM_SIGNAL_TYPE
++{
++   SIGNAL_NONE = 0,
++   SIGNAL_LONG,
++   SIGNAL_SHORT,
++   SIGNAL_EXIT_LONG,
++   SIGNAL_EXIT_SHORT
++};
++
++enum ENUM_TRADE_ACTION
++{
++   TRADE_ACTION_NONE = 0,
++   TRADE_ACTION_OPEN_LONG,
++   TRADE_ACTION_OPEN_SHORT,
++   TRADE_ACTION_CLOSE,
++   TRADE_ACTION_MODIFY_SLTP
++};
++
++enum ENUM_MODULE_STATUS
++{
++   MODULE_OK = 0,
++   MODULE_WARN,
++   MODULE_ERROR
++};
++
++enum ENUM_ERROR_SEVERITY
++{
++   ERR_SEV_INFO = 0,
++   ERR_SEV_RETRYABLE,
++   ERR_SEV_FATAL
++};
++
++struct SIndicatorSnapshot
++{
++   datetime barTime;
++   double emaFast;
++   double emaSlow;
++   double atr;
++   double donchianHigh;
++   double donchianLow;
++   bool isValid;
++};
++
++struct SSignalDecision
++{
++   ENUM_SIGNAL_TYPE signal;
++   double confidence;
++   string reasonCode;
++   bool canTrade;
++};
++
++struct SPositionSnapshot
++{
++   bool hasPosition;
++   long ticket;
++   ENUM_POSITION_TYPE type;
++   double volume;
++   double priceOpen;
++   double sl;
++   double tp;
++   double profit;
++};
++
++struct STradeRequestPlan
++{
++   ENUM_TRADE_ACTION action;
++   double volume;
++   double sl;
++   double tp;
++   string comment;
++};
++
++struct SModuleHealth
++{
++   ENUM_MODULE_STATUS status;
++   int errorCode;
++   string message;
++};
+diff --git a/Trading/PositionService.mqh b/Trading/PositionService.mqh
+new file mode 100644
+index 0000000..a7e17b8
+--- /dev/null
++++ b/Trading/PositionService.mqh
+@@ -0,0 +1,33 @@
++#pragma once
++
++#include "..\SignalEA_v1.types.mqh"
++#include "..\SignalEA_v1.constants.mqh"
++
++class PositionService
++{
++public:
++   bool GetCurrent(const string symbol, const long magic, SPositionSnapshot &outPos) const;
++   bool HasOpenPosition(const string symbol, const long magic) const;
++};
++
++bool PositionService::GetCurrent(const string symbol, const long magic, SPositionSnapshot &outPos) const
++{
++   outPos.hasPosition = false;
++   outPos.ticket = INVALID_TICKET;
++   outPos.type = POSITION_TYPE_BUY;
++   outPos.volume = 0.0;
++   outPos.priceOpen = 0.0;
++   outPos.sl = 0.0;
++   outPos.tp = 0.0;
++   outPos.profit = 0.0;
++   return true;
++}
++
++bool PositionService::HasOpenPosition(const string symbol, const long magic) const
++{
++   SPositionSnapshot pos;
++   if(!GetCurrent(symbol, magic, pos))
++      return false;
++
++   return pos.hasPosition;
++}
+diff --git a/Trading/TradeExecutor.mqh b/Trading/TradeExecutor.mqh
+new file mode 100644
+index 0000000..09e80b6
+--- /dev/null
++++ b/Trading/TradeExecutor.mqh
+@@ -0,0 +1,49 @@
++#pragma once
++
++#include <Trade/Trade.mqh>
++#include "..\SignalEA_v1.types.mqh"
++
++class TradeExecutor
++{
++private:
++   CTrade m_trade;
++
++public:
++   bool ExecutePlan(const STradeRequestPlan &plan);
++   bool ClosePosition(const long ticket);
++   bool ModifyPosition(const long ticket, const double sl, const double tp);
++
++   // Intentionally not implemented in this phase.
++   bool OpenLong(const STradeRequestPlan &plan);
++
++   // Intentionally not implemented in this phase.
++   bool OpenShort(const STradeRequestPlan &plan);
++};
++
++bool TradeExecutor::ExecutePlan(const STradeRequestPlan &plan)
++{
++   switch(plan.action)
++   {
++      case TRADE_ACTION_OPEN_LONG:
++         return false;
++      case TRADE_ACTION_OPEN_SHORT:
++         return false;
++      case TRADE_ACTION_CLOSE:
++         return true;
++      case TRADE_ACTION_MODIFY_SLTP:
++         return true;
++      default:
++         break;
++   }
++   return false;
++}
++
++bool TradeExecutor::ClosePosition(const long ticket)
++{
++   return true;
++}
++
++bool TradeExecutor::ModifyPosition(const long ticket, const double sl, const double tp)
++{
++   return true;
++}
