@@ -39,7 +39,7 @@ bool AppKernel::Initialize(void)
    m_logger.SetLevel(InpLogLevel);
    m_state.SetEAState(EA_STATE_BOOT);
 
-   bool indicatorReady = m_indicatorHub.Initialize(_Symbol, InpSignalTf);
+   bool indicatorReady = m_indicatorHub.Initialize(_Symbol, InpSignalTf, InpDonchianPeriod);
    if(!indicatorReady)
    {
       m_state.SetEAState(EA_STATE_DEGRADED);
@@ -73,29 +73,28 @@ void AppKernel::ManagePosition(void)
 bool AppKernel::ProcessNewH1Bar(const datetime barTime)
 {
    SIndicatorSnapshot ind;
-   SPositionSnapshot pos;
 
-   if(!m_indicatorHub.Refresh())
+   if(!m_indicatorHub.BuildSnapshot(ind))
+   {
+      ind.isValid = false;
+      m_logger.Error("[SNAPSHOT] Failed to build indicator snapshot.");
       return false;
+   }
 
-   if(!m_indicatorHub.GetSnapshot(ind))
-      return false;
+   string snapshotTime = TimeToString(ind.barTime, TIME_DATE | TIME_MINUTES);
+   if(ind.barTime != barTime && barTime > 0)
+      snapshotTime = TimeToString(barTime, TIME_DATE | TIME_MINUTES);
 
-   if(!m_positionService.GetCurrent(_Symbol, InpMagicNumber, pos))
-      return false;
+   Print("[SNAPSHOT]");
+   Print("Time: ", snapshotTime);
+   Print("EMA50: ", DoubleToString(ind.emaFast, 6));
+   Print("EMA200: ", DoubleToString(ind.emaSlow, 6));
+   Print("ATR: ", DoubleToString(ind.atr, 6));
+   Print("DonchianHigh: ", DoubleToString(ind.donchianHigh, 6));
+   Print("DonchianLow: ", DoubleToString(ind.donchianLow, 6));
+   Print("Valid: ", ind.isValid ? "true" : "false");
 
-   SSignalDecision decision = m_signalEngine.Evaluate(ind, pos);
-   if(!m_riskPolicy.CanOpen(decision, pos))
-      return true;
-
-   STradeRequestPlan plan;
-   plan.action = TRADE_ACTION_NONE;
-   plan.volume = 0.0;
-   plan.sl = 0.0;
-   plan.tp = 0.0;
-   plan.comment = "ARCH_PLACEHOLDER";
-
-   return m_tradeExecutor.ExecutePlan(plan);
+   return ind.isValid;
 }
 
 void AppKernel::Shutdown(const int reason)

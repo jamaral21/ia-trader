@@ -6,4 +6,5 @@ input int InpMaxSpreadPoints = 30;
 input bool InpAllowLong = true;
 input bool InpAllowShort = true;
 input ENUM_TIMEFRAMES InpSignalTf = PERIOD_H1;
+input int InpDonchianPeriod = 20;
 input int InpLogLevel = 2;
