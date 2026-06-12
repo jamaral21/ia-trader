@@ -18,6 +18,7 @@ Base mantenible y extensible para implementar SignalEA_v1 por etapas, sin acopla
 - SIndicatorSnapshot: contrato unico de indicadores para motor de senales.
 - SSignalDecision: intencion de negocio desacoplada de ejecucion.
 - STradeRequestPlan: plan ejecutable y serializable para modo local o replicado.
+- ENUM_BREAKOUT_STATE + API de StateStore: control explicito para regla "una operacion por breakout".
 
 ## Flujo OnInit
 1. Crear kernel y logger.
@@ -27,13 +28,15 @@ Base mantenible y extensible para implementar SignalEA_v1 por etapas, sin acopla
 
 ## Flujo OnTick
 1. Guard clause de estado.
-2. Detectar nueva vela H1 con BarClock.
-3. Si no hay nueva vela, salir.
-4. Actualizar snapshot de indicadores.
-5. Leer posicion actual.
-6. Evaluar senal y politicas de riesgo.
-7. Construir plan de trade y delegar a TradeExecutor.
-8. Registrar resultado en estado global.
+2. Ejecutar ManagePosition() en TODOS los ticks.
+3. Detectar nueva vela H1 con BarClock.
+4. Si no hay nueva vela, salir.
+5. Si hay nueva vela, ejecutar ProcessNewH1Bar() una sola vez por vela cerrada.
+6. Actualizar snapshot de indicadores.
+7. Leer posicion actual.
+8. Evaluar senal y politicas de riesgo.
+9. Construir plan de trade y delegar a TradeExecutor.
+10. Registrar resultado en estado global.
 
 ## Flujo OnDeinit
 1. Cambiar a estado STOPPING.
@@ -49,6 +52,26 @@ Base mantenible y extensible para implementar SignalEA_v1 por etapas, sin acopla
 - EA_STATE_STOPPING
 - EA_STATE_STOPPED
 
+## Estado de breakout
+- BREAKOUT_READY
+- BREAKOUT_LOCKED
+
+API en StateStore:
+- LockBreakout()
+- UnlockBreakout()
+- IsBreakoutLocked()
+
+Nota: solo se define el estado y sus accesores. La logica de transicion se implementara en fases posteriores.
+
+## Estrategia de nueva vela H1 (BarClock)
+- BarClock mantiene estado interno persistente:
+	- m_lastProcessedBarTime
+	- m_lastSymbol
+	- m_lastTf
+- IsNewBar() solo devuelve true cuando existe una vela cerrada mas nueva que la ultima procesada en el mismo contexto simbolo/timeframe.
+- En primer muestreo, reinicio de EA o cambio de simbolo/timeframe, BarClock sincroniza baseline y devuelve false para evitar disparos falsos.
+- ProcessNewH1Bar() nunca debe ejecutarse mas de una vez por vela cerrada.
+
 ## Dependencias (texto)
 SignalEA_v1.mq5
 -> AppKernel
@@ -57,6 +80,7 @@ SignalEA_v1.mq5
 
 AppKernel
 -> BarClock
+-> ManagePosition (flujo por tick)
 -> IndicatorHub
 -> SignalEngine
 -> PositionService
@@ -74,3 +98,8 @@ Integration (futuro)
 - TradeExecutor::OpenShort
 - LotModel::CalculateLotSize
 - TrailingService::ManageTrailing
+
+## Correcciones arquitectonicas recientes
+- Se corrigio BarClock::IsNewBar para no disparar en todos los ticks.
+- Se agrego estado dedicado de breakout en StateStore.
+- Se separo flujo OnTick entre gestion por tick (ManagePosition) y evaluacion por nueva vela (ProcessNewH1Bar).
